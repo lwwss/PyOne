@@ -1,4 +1,6 @@
 #-*- coding=utf-8 -*-
+import eventlet
+eventlet.monkey_patch()
 from flask import Blueprint,redirect,url_for,request,render_template,flash,session,jsonify,Response,make_response
 from flask_sqlalchemy import Pagination
 from function import *
@@ -11,16 +13,14 @@ import subprocess
 import random
 import urllib
 from shelljob import proc
-import eventlet
 
-eventlet.monkey_patch()
 
 
 admin = Blueprint('admin', __name__,url_prefix='/admin')
 
 ############功能函数
 def set(key,value,user='A'):
-    allow_key=['title','downloadUrl_timeout','allow_site','password','client_secret','client_id','share_path','other_name','tj_code']
+    allow_key=['title','downloadUrl_timeout','allow_site','password','client_secret','client_id','share_path','other_name','tj_code','ARIA2_HOST','ARIA2_PORT','ARIA2_SECRET','ARIA2_SCHEME']
     if key not in allow_key:
         return u'禁止修改'
     print 'set {}:{}'.format(key,value)
@@ -29,9 +29,9 @@ def set(key,value,user='A'):
         old_text=f.read()
     with open(config_path,'w') as f:
         if key in ['client_secret','client_id','share_path','other_name']:
-            old_kv=re.findall('"{}":{{[\w\W]*?}}'.format(user),old_text)[0]
-            new_kv=re.sub('"{}":.*?,'.format(key),'"{}":"{}",'.format(key,value),old_kv)
-            new_text=old_text.replace(old_kv,new_kv)
+            old_kv=re.findall('"{}":{{[\w\W]*}}'.format(user),old_text)[0]
+            new_kv=re.sub('"{}":.*?,'.format(key),'"{}":"{}",'.format(key,value),old_kv,1)
+            new_text=old_text.replace(old_kv,new_kv,1)
         elif key=='allow_site':
             value=value.split(',')
             new_text=re.sub('{}=.*'.format(key),'{}={}'.format(key,value),old_text)
@@ -85,6 +85,10 @@ def setting():
         downloadUrl_timeout=request.form.get('downloadUrl_timeout',5*60)
         allow_site=request.form.get('allow_site','no-referrer')
         tj_code=request.form.get('tj_code','')
+        ARIA2_HOST=request.form.get('ARIA2_HOST','localhost').replace('https://','').replace('http://','')
+        ARIA2_PORT=request.form.get('ARIA2_PORT',6800)
+        ARIA2_SECRET=request.form.get('ARIA2_SECRET','')
+        ARIA2_SCHEME=request.form.get('ARIA2_SCHEME','http')
         password1=request.form.get('password1')
         password2=request.form.get('password2')
         new_password=password
@@ -98,6 +102,10 @@ def setting():
         set('downloadUrl_timeout',downloadUrl_timeout)
         set('allow_site',allow_site)
         set('tj_code',tj_code)
+        set('ARIA2_HOST',ARIA2_HOST)
+        set('ARIA2_PORT',ARIA2_PORT)
+        set('ARIA2_SECRET',ARIA2_SECRET)
+        set('ARIA2_SCHEME',ARIA2_SCHEME)
         set('password',new_password)
         ####网盘信息处理
         for k,v in request.form.to_dict().items():
@@ -296,6 +304,8 @@ def server_to_one():
 def setFile(filename=None):
     if request.method=='POST':
         path=request.form.get('path')
+        if path.split(':')[-1]=='':
+            path=path.split(':')[0]+':/'
         user,n_path=path.split(':')
         filename=request.form.get('filename')
         if not n_path.startswith('/'):
@@ -324,6 +334,8 @@ def setFile(filename=None):
             info['msg']='超时'
         return jsonify(info)
     path=urllib.unquote(request.args.get('path'))
+    if path.split(':')[-1]=='':
+        path=path.split(':')[0]+':/'
     user,n_path=path.split(':')
     _,fid,i=has_item(path,filename)
     if fid!=False:
@@ -343,6 +355,7 @@ def delete():
     infos['delete']=0
     infos['fail']=0
     for id in ids:
+        print 'delete {}'.format(id)
         file=items.find_one({'id':id})
         name=file['name']
         # path=file['path'].replace('/'+name,'').replace(name,'')
@@ -391,8 +404,46 @@ def MoveFileToNewFolder():
     result=MoveFile(fileid,new_folder_path,user)
     return jsonify({'result':result})
 
+######离线下载---调用aria2
+@admin.route('/off_download',methods=['POST','GET'])
+def off_download():
+    if request.method=='POST':
+        p,status=get_aria2()
+        if not status:
+            return jsonify({'status':False,'msg':p})
+        urls=request.form.get('urls').split('\n')
+        grand_path=request.form.get('grand_path')
+        user=request.form.get('user')
+        for url in urls:
+            if url.strip()!='':
+                cmd=u'python {} download_and_upload "{}" "{}" {}'.format(os.path.join(config_dir,'function.py'),url,grand_path,user)
+                subprocess.Popen(cmd,shell=True)
+        return jsonify({'status':True,'msg':'ok'})
+    path=request.args.get('path')
+    user,grand_path=path.split(':')
+    return render_template('admin/offdownload.html',grand_path=grand_path,cur_user=user)
 
 
+@admin.route('/jsonrpc',methods=['POST'])
+def RPCserver():
+    action=request.form.get('action')
+    allow_action=['tellActive','tellSuccess','tellFail','tellUnselected','pause','pauseAll','unpause','unpauseAll','remove','removeAll','restart','unselected','selected']
+    action_dict=dict(tellActive=1,tellSuccess=0,tellFail=-1,tellUnselected=2)
+    if action not in allow_action:
+        return jsonify({'code':0,'msg':'not allow action'})
+    if action in ['tellActive','tellSuccess','tellFail','tellUnselected']:
+        status=action_dict[action]
+        ret={'code':1,'msg':'get data success','result':get_tasks(status)}
+    elif action in ['pause','pauseAll','unpause','unpauseAll','remove','removeAll','restart','unselected','selected']:
+        ret=None
+        gids=request.form.get('gid').split('####')
+        ret1=Aria2Method(action=action,gids=gids)
+        ret2=DBMethod(action=action,gids=gids)
+        if ret1 is not None:
+            ret=ret1
+        else:
+            ret=ret2
+    return jsonify(ret)
 
 
 @admin.route('/login',methods=["POST","GET"])
@@ -451,12 +502,12 @@ def install():
                 token=ReFreshToken(refresh_token,user)
                 with open(os.path.join(config_dir,'data/{}_token.json'.format(user)),'w') as f:
                     json.dump(token,f,ensure_ascii=False)
-                return make_response('<h1>授权成功!<a href="/#">点击进入首页</a><br>请在后台另开一个ssh窗口，运行：<pre>python function.py UpdateFile</pre>进行更新数据操作</h1>')
+                return make_response('<h1>授权成功!<a href="/?t={}">点击进入首页</a><br>请先在<B>后台-页面缓存</B>，运行更新数据操作<！/h1>'.format(time.time()))
             else:
                 return jsonify(Atoken)
     step=request.args.get('step',type=int)
     user=request.args.get('user','A')
-    resp=render_template('admin/install_0.html',step=step,cur_user=user)
+    resp=render_template('admin/install_0.html',step=step,cur_user=user,redirectUrl=redirect_uri)
     return resp
 
 

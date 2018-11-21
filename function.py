@@ -16,16 +16,19 @@ import shutil
 import base64
 import humanize
 import StringIO
+import subprocess
 from dateutil.parser import parse
 from Queue import Queue
 from threading import Thread
 from redis import Redis
 from config import *
+from aria2 import PyAria2
 from pymongo import MongoClient,ASCENDING,DESCENDING
 ######mongodb
 client = MongoClient('localhost',27017)
 db=client.three
 items=db.items
+down_db=db.down_db
 rd=Redis(host='localhost',port=6379)
 
 #######授权链接
@@ -42,7 +45,7 @@ def convert2unicode(string):
 
 def get_value(key,user='A'):
     allow_key=['client_secret','client_id']
-    print('get user {}\'s {}'.format(user,key))
+    #print('get user {}\'s {}'.format(user,key))
     if key not in allow_key:
         return u'禁止获取'
     config_path=os.path.join(config_dir,'config.py')
@@ -101,16 +104,19 @@ def ReFreshToken(refresh_token,user='A'):
 
 def GetToken(Token_file='token.json',user='A'):
     Token_file='{}_{}'.format(user,Token_file)
-    if os.path.exists(os.path.join(data_dir,Token_file)):
-        token=open_json(os.path.join(data_dir,Token_file))
+    token_path=os.path.join(data_dir,Token_file)
+    if os.path.exists(token_path):
+        token=open_json(token_path)
         try:
-            if time.time()>int(token.get('expires_on')):
+            if time.time()>float(token.get('expires_on')):
                 print 'token timeout'
                 refresh_token=token.get('refresh_token')
                 token=ReFreshToken(refresh_token,user)
                 if token.get('access_token'):
-                    with open(os.path.join(data_dir,Token_file),'w') as f:
+                    with open(token_path,'w') as f:
                         json.dump(token,f,ensure_ascii=False)
+                else:
+                    print token
         except:
             with open(os.path.join(data_dir,'{}_Atoken.json'.format(user)),'r') as f:
                 Atoken=json.load(f)
@@ -118,11 +124,12 @@ def GetToken(Token_file='token.json',user='A'):
             token=ReFreshToken(refresh_token,user)
             token['expires_on']=str(time.time()+3599)
             if token.get('access_token'):
-                    with open(os.path.join(data_dir,Token_file),'w') as f:
+                    with open(token_path,'w') as f:
                         json.dump(token,f,ensure_ascii=False)
         return token.get('access_token')
     else:
         return False
+
 
 
 def GetAppUrl():
@@ -169,7 +176,7 @@ def Dir(path=u'A:/'):
             n_path=n_path[:-1]
         if not n_path.startswith('/'):
             n_path='/'+n_path
-        n_path=urllib.quote(n_path)
+        n_path=urllib.quote(n_path.encode('utf-8'))
         BaseUrl=app_url+u'v1.0/me/drive/root:{}:/children?expand=thumbnails'.format(n_path)
         queue=Queue()
         # queue.put(dict(url=BaseUrl,grandid=grandid,parent=parent,trytime=1))
@@ -225,7 +232,7 @@ def Dir_all(path=u'A:/'):
                 items.delete_many({'parent':parent_id})
             grandid=idx+1
             parent=parent_id
-        n_path=urllib.quote(n_path)
+        n_path=urllib.quote(n_path.encode('utf-8'))
         BaseUrl=app_url+u'v1.0/me/drive/root:{}:/children?expand=thumbnails'.format(n_path)
         queue=Queue()
         g=GetItemThread(queue,user)
@@ -294,7 +301,38 @@ class GetItemThread(Thread):
                         folder=items.find_one({'id':value['id']})
                         if folder is not None:
                             if folder['size_order']==value['size']: #文件夹大小未变化，不更新
-                                print(u'path:{},origin size:{},current size:{}'.format(value['name'],folder['size_order'],value['size']))
+                                print(u'path:{},origin size:{},current size:{}--------no change'.format(value['name'],folder['size_order'],value['size']))
+                            else:
+                                items.delete_one({'id':value['id']})
+                                item['type']='folder'
+                                item['user']=self.user
+                                item['order']=0
+                                item['name']=convert2unicode(value['name'])
+                                item['id']=convert2unicode(value['id'])
+                                item['size']=humanize.naturalsize(value['size'], gnu=True)
+                                item['size_order']=int(value['size'])
+                                item['lastModtime']=date_to_char(parse(value['lastModifiedDateTime']))
+                                item['grandid']=grandid
+                                item['parent']=parent
+                                grand_path=value.get('parentReference').get('path').replace('/drive/root:','')
+                                if grand_path=='':
+                                    path=convert2unicode(value['name'])
+                                else:
+                                    path=grand_path.replace(self.share_path,'',1)+'/'+convert2unicode(value['name'])
+                                if path.startswith('/') and path!='/':
+                                    path=path[1:]
+                                if path=='':
+                                    path=convert2unicode(value['name'])
+                                path='{}:/{}'.format(self.user,path)
+                                item['path']=path
+                                subfodler=items.insert_one(item)
+                                if value.get('folder').get('childCount')==0:
+                                    continue
+                                else:
+                                    parent_path=value.get('parentReference').get('path').replace('/drive/root:','')
+                                    path=urllib.quote(convert2unicode(parent_path+'/'+value['name']))
+                                    url=app_url+'v1.0/me/drive/root:{}:/children?expand=thumbnails'.format(path)
+                                    self.queue.put(dict(url=url,grandid=grandid+1,parent=item['id'],trytime=1))
                         else:
                             items.delete_one({'id':value['id']})
                             item['type']='folder'
@@ -322,7 +360,9 @@ class GetItemThread(Thread):
                             if value.get('folder').get('childCount')==0:
                                 continue
                             else:
-                                url=app_url+'v1.0/me'+value.get('parentReference').get('path')+'/'+value.get('name')+':/children?expand=thumbnails'
+                                parent_path=value.get('parentReference').get('path').replace('/drive/root:','')
+                                path=urllib.quote(convert2unicode(parent_path+'/'+value['name']))
+                                url=app_url+'v1.0/me/drive/root:{}:/children?expand=thumbnails'.format(path)
                                 self.queue.put(dict(url=url,grandid=grandid+1,parent=item['id'],trytime=1))
                     else:
                         if items.find_one({'id':value['id']}) is not None: #文件存在
@@ -371,12 +411,12 @@ class GetItemThread(Thread):
     def GetItemByPath(self,path):
         app_url=GetAppUrl()
         token=GetToken(user=self.user)
+        path=urllib.quote(convert2unicode(path))
         if path=='' or path=='/':
             url=app_url+u'v1.0/me/drive/root/'
-        if path=='/':
+        else:
             url=app_url+u'v1.0/me/drive/root:{}:/'.format(path)
         header={'Authorization': 'Bearer {}'.format(token)}
-        url=app_url+u'v1.0/me/drive/root:{}:/'.format(path)
         r=requests.get(url,headers=header)
         data=json.loads(r.content)
         return data
@@ -422,7 +462,7 @@ def UpdateFile(renew='all'):
 def FileExists(filename,user='A'):
     token=GetToken(user=user)
     headers={'Authorization':'bearer {}'.format(token),'Content-Type':'application/json'}
-    search_url=app_url+"v1.0/me/drive/root/search(q='{}')".format(filename)
+    search_url=app_url+"v1.0/me/drive/root/search(q='{}')".format(convert2unicode(filename))
     r=requests.get(search_url,headers=headers)
     jsondata=json.loads(r.text)
     if len(jsondata['value'])==0:
@@ -487,7 +527,7 @@ def _file_content(path,offset,length):
 def _upload(filepath,remote_path,user='A'): #remote_path like 'share/share.mp4'
     token=GetToken(user=user)
     headers={'Authorization':'bearer {}'.format(token)}
-    url=app_url+'v1.0/me/drive/root:'+urllib.quote(remote_path)+':/content'
+    url=app_url+'v1.0/me/drive/root:{}:/content'.format(urllib.quote(convert2unicode(remote_path)))
     r=requests.put(url,headers=headers,data=open(filepath,'rb'))
     data=json.loads(r.content)
     trytime=1
@@ -575,15 +615,16 @@ def _GetAllFile(parent_id="",parent_path="",filelist=[]):
 def AddResource(data,user='A'):
     #检查父文件夹是否在数据库，如果不在则获取添加
     grand_path=data.get('parentReference').get('path').replace('/drive/root:','')
+    share_path=od_users.get(user).get('share_path')
     if grand_path=='':
         parent_id=''
         grandid=0
     else:
-        g=GetItemThread(Queue())
+        g=GetItemThread(Queue(),user)
         parent_id=data.get('parentReference').get('id')
         grandid=len(data.get('parentReference').get('path').replace('/drive/root:','').split('/'))-1
         grand_path=grand_path[1:]
-        parent_path=''
+        parent_path='/'
         pid=''
         for idx,p in enumerate(grand_path.split('/')):
             parent=items.find_one({'name':p,'grandid':idx,'parent':pid})
@@ -593,8 +634,12 @@ def AddResource(data,user='A'):
             else:
                 parent_path='/'.join([parent_path,p])
                 fdata=g.GetItemByPath(parent_path)
+                path=user+':/'+parent_path.replace('///','/')
+                path=path.replace('///','/').replace('//','/')
                 item={}
                 item['type']='folder'
+                item['user']=user
+                item['order']=0
                 item['name']=fdata.get('name')
                 item['id']=fdata.get('id')
                 item['size']=humanize.naturalsize(fdata.get('size'), gnu=True)
@@ -602,6 +647,7 @@ def AddResource(data,user='A'):
                 item['lastModtime']=date_to_char(parse(fdata['lastModifiedDateTime']))
                 item['grandid']=idx
                 item['parent']=pid
+                item['path']=path
                 items.insert_one(item)
                 pid=fdata.get('id')
     #插入数据
@@ -623,6 +669,7 @@ def AddResource(data,user='A'):
         path=path[1:]
     if path=='':
         path=convert2unicode(data['name'])
+    path=user+':/'+path
     item['path']=path
     if GetExt(data['name']) in ['bmp','jpg','jpeg','png','gif']:
         item['order']=3
@@ -640,7 +687,7 @@ def AddResource(data,user='A'):
 def CreateUploadSession(path,user='A'):
     token=GetToken(user=user)
     headers={'Authorization':'bearer {}'.format(token),'Content-Type':'application/json'}
-    url=app_url+'v1.0/me/drive/root:'+urllib.quote(path)+':/createUploadSession'
+    url=app_url+u'v1.0/me/drive/root:{}:/createUploadSession'.format(urllib.quote(convert2unicode(path)))
     data={
           "item": {
             "@microsoft.graph.conflictBehavior": "rename",
@@ -669,29 +716,27 @@ def UploadSession(uploadUrl, filepath,user):
         #上传完成
         if code==0:
             AddResource(result['info'],user)
-            yield {'status':'upload success!'}
+            yield {'status':'upload success!','uploadUrl':uploadUrl}
             break
         #分片上传成功
         elif code==1:
             trytime=1
             offset=result['offset']
             per=round((float(offset)/filesize)*100,1)
-            yield {'status':'partition upload success! {}%'.format(per)}
+            yield {'status':'partition upload success! {}%'.format(per),'uploadUrl':uploadUrl}
         #错误，重试
         elif code==2:
             if result['sys_msg']=='The request has been throttled':
                 print(result['sys_msg']+' ; wait for 1800s')
-                yield {'status':'The request has been throttled! wait for 1800s'}
+                yield {'status':'The request has been throttled! wait for 1800s','uploadUrl':uploadUrl}
                 time.sleep(1800)
             offset=offset
             trytime=result['trytime']
-            yield {'status':'partition upload fail! retry!'}
+            yield {'status':'partition upload fail! retry!','uploadUrl':uploadUrl}
         #重试超过3次，放弃
         elif code==3:
-            yield {'status':'partition upload fail! touch max retry times!'}
+            yield {'status':'partition upload fail! touch max retry times!','uploadUrl':uploadUrl}
             break
-
-
 
 def Upload_for_server(filepath,remote_path=None,user='A'):
     token=GetToken(user=user)
@@ -702,6 +747,8 @@ def Upload_for_server(filepath,remote_path=None,user='A'):
         remote_path=os.path.join(remote_path,os.path.basename(filepath))
     if not remote_path.startswith('/'):
         remote_path='/'+remote_path
+    filepath=convert2unicode(filepath)
+    remote_path=convert2unicode(remote_path)
     print('local file path:{}, remote file path:{}'.format(filepath,remote_path))
     if _filesize(filepath)<1024*1024*3.25:
         for msg in _upload(filepath,remote_path,user):
@@ -716,9 +763,50 @@ def Upload_for_server(filepath,remote_path=None,user='A'):
                 for msg in UploadSession(uploadUrl,filepath,user):
                     yield msg
             else:
-                print(session_data.get('error').get('msg'))
-                print('create upload session fail! {}'.format(remote_path))
-                yield {'status':'create upload session fail!'}
+                print('user:{} create upload session fail! {},{}'.format(user,remote_path,session_data.get('error').get('message')))
+                yield {'status':'user:{};create upload session fail!{}'.format(user,session_data.get('error').get('message'))}
+
+def ContinueUpload(filepath,uploadUrl,user):
+    headers={'Content-Type':'application/json'}
+    r=requests.get(uploadUrl,headers=headers)
+    data=json.loads(r.text)
+    offset=data.get('nextExpectedRanges')[0].split('-')[0]
+    expires_on=time.mktime(parse(data.get('expirationDateTime')).timetuple())
+    if time.time()>expires_on:
+        yield 'alright expired!'
+    else:
+        length=327680*10
+        trytime=1
+        filesize=_filesize(filepath)
+        while 1:
+            result=_upload_part(uploadUrl, filepath, offset, length,trytime=trytime)
+            code=result['code']
+            #上传完成
+            if code==0:
+                AddResource(result['info'],user)
+                yield {'status':'upload success!'}
+                break
+            #分片上传成功
+            elif code==1:
+                trytime=1
+                offset=result['offset']
+                per=round((float(offset)/filesize)*100,1)
+                yield {'status':'partition upload success! {}%'.format(per)}
+            #错误，重试
+            elif code==2:
+                if result['sys_msg']=='The request has been throttled':
+                    print(result['sys_msg']+' ; wait for 1800s')
+                    yield {'status':'The request has been throttled! wait for 1800s'}
+                    time.sleep(1800)
+                offset=offset
+                trytime=result['trytime']
+                yield {'status':'partition upload fail! retry!'}
+            #重试超过3次，放弃
+            elif code==3:
+                yield {'status':'partition upload fail! touch max retry times!'}
+                break
+
+
 
 def Upload(filepath,remote_path=None,user='A'):
     token=GetToken(user=user)
@@ -984,6 +1072,384 @@ def RemoveRepeatFile():
     except Exception as e:
         print(e)
         return
+
+def get_aria2():
+    try:
+        p=PyAria2()
+        return p,True
+    except Exception as e:
+        return e,False
+
+
+
+def download_and_upload(url,remote_dir,user,gid=None):
+    p,status=get_aria2()
+    down_path=os.path.join(config_dir,'upload')
+    url=url.lower()
+    #重新下载
+    if gid is not None:
+        task=down_db.find_one({'gid':gid})
+        if task is None:
+            return False
+        if task['up_status']!='100.0%':
+            new_value={}
+            new_value['up_status']=u'待机'
+            new_value['status']=1
+            down_db.update_many({'gid':gid},{'$set':new_value})
+    else:
+        cur_order=down_db.count()
+        option={"dir":down_path,"split":"16","max-connection-per-server":"8","seed-ratio":"0","header":["User-Agent:Transmission/2.77"]}
+        item={}
+        gid=json.loads(p.addUri(url,option))[0]["result"]
+        item['gid']=gid
+        a=json.loads(p.tellStatus(gid))[0]["result"]
+        if 'magnet:?xt=' in url:
+            name=re.findall('magnet:\?xt=urn:btih:(.{,40})',url)[0].lower()+'.torrent'
+            localpath=os.path.join(down_path,name)
+        else:
+            name=a['files'][0]['path'].replace(down_path+'/','').replace(down_path,'').replace(down_path[:-1],'')
+            localpath=a['files'][0]['path']
+        item['name']=name
+        item['idx']=0
+        item['localpath']=localpath
+        item['downloadUrl']=url
+        item['selected']='true'
+        item['selectable']='false'
+        item['user']=user
+        item['remote_dir']=remote_dir
+        item['uploadUrl']=''
+        item['size']=humanize.naturalsize(a['totalLength'], gnu=True)
+        item['down_status']=u'{}%'.format(round(float(a['completedLength'])/(float(a['totalLength'])+0.1)*100,0))
+        item['up_status']=u'待机'
+        item['status']=1
+        down_db.insert_one(item)
+    while 1:
+        a=json.loads(p.tellStatus(gid))[0]["result"]
+        if a.get('followedBy'):
+            old_status={}
+            old_status['status']=0
+            old_status['up_status']=u'磁力文件，无需上传'
+            down_db.find_one_and_update({'gid':gid},{'$set':old_status})
+            magnet=re.findall('magnet:\?xt=urn:btih:(.{,40})',down_db.find_one({'gid':gid})['downloadUrl'])[0].lower()+'.torrent'
+            old_path=os.path.join(down_path,magnet)
+            try:
+                os.remove(old_path)
+            except:
+                print("删除种子文件失败")
+            gid=a.get('followedBy')[0]
+            aa=json.loads(p.tellStatus(gid))[0]["result"]
+            for idx,file in enumerate(aa['files']):
+                new_item={}
+                new_item['gid']=gid
+                new_item['idx']=idx
+                new_item['name']=file['path'].replace(down_path+'/','').replace(down_path,'').replace(down_path[:-1],'')
+                new_item['localpath']=file['path']
+                new_item['downloadUrl']=aa['infoHash']
+                new_item['selected']='true'
+                new_item['selectable']='true'
+                new_item['user']=user
+                new_item['remote_dir']=remote_dir
+                new_item['uploadUrl']=''
+                new_item['size']=humanize.naturalsize(file['length'], gnu=True)
+                new_item['down_status']=u'{}%'.format(round(float(file['completedLength'])/(float(file['length'])+0.1)*100,0))
+                new_item['up_status']=u'待机'
+                new_item['status']=1
+                down_db.insert_one(new_item)
+            a=json.loads(p.tellStatus(gid))[0]["result"]
+        for idx,file in enumerate(a['files']):
+            t=down_db.find_one({'gid':gid,'idx':idx})
+            if t['down_status']=='100.0%':
+                if t['up_status']=='待机':
+                    new_value['up_status']=u'准备上传'
+                    down_db.find_one_and_update({'gid':gid,'idx':idx},{'$set':new_value})
+                    upload_status(gid,idx,remote_dir,user)
+                else:
+                    continue
+            if t['selected']=='false':
+                continue
+            name=file['path'].replace(down_path+'/','').replace(down_path,'').replace(down_path[:-1],'')
+            new_value={'down_status':u'{}%'.format(round(float(file['completedLength'])/(float(file['length'])+0.1)*100,0))}
+            new_value['name']=name
+            new_value['size']=humanize.naturalsize(file['length'], gnu=True)
+            new_value['localpath']=file['path']
+            if a['status']=='complete' or (file['completedLength']==file['length'] and int(file['length'])!=0):
+                new_value['up_status']=u'准备上传'
+                down_db.find_one_and_update({'gid':gid,'idx':idx},{'$set':new_value})
+                upload_status(gid,idx,remote_dir,user)
+                break
+            elif a['status']=='active' or a['status']=='waiting':
+                time.sleep(1)
+                down_db.find_one_and_update({'gid':gid,'idx':idx},{'$set':new_value})
+            elif a['status']=='paused':
+                new_value['down_status']=u'暂停下载'
+                down_db.find_one_and_update({'gid':gid,'idx':idx},{'$set':new_value})
+            else:
+                print('下载出错')
+                new_value['down_status']=u'下载出错'
+                new_value['status']=-1
+                down_db.find_one_and_update({'gid':gid,'idx':idx},{'$set':new_value})
+                break
+            time.sleep(2)
+
+def upload_status(gid,idx,remote_dir,user):
+    item=down_db.find_one({'gid':gid,'idx':idx})
+    localpath=item['localpath']
+    if not remote_dir.endswith('/'):
+        remote_dir=remote_dir+'/'
+    remote_path=os.path.join(remote_dir,item['name'])
+    if not os.path.exists(localpath):
+        new_value={}
+        new_value['up_status']=u'本地文件不存在。检查：{}'.format(localpath)
+        new_value['status']=-1
+        down_db.find_one_and_update({'_id':item['_id']},{'$set':new_value})
+        return
+    _upload_session=Upload_for_server(localpath,remote_path,user)
+    while 1:
+        try:
+            new_value={}
+            data=_upload_session.next()
+            msg=data['status']
+            """
+            partition upload success
+            The request has been throttled!
+            partition upload fail! retry
+            partition upload fail!
+            file exists
+            create upload session fail
+            """
+            if 'partition upload success' in msg:
+                new_value['up_status']=msg
+                new_value['uploadUrl']=data.get('uploadUrl')
+                new_value['status']=1
+            elif 'The request has been throttled' in msg:
+                new_value['up_status']='api受限！智能等待30分钟'
+                new_value['status']=0
+            elif 'partition upload fail! retry' in msg:
+                new_value['up_status']='上传失败，等待重试'
+                new_value['status']=1
+            elif 'partition upload fail' in msg:
+                new_value['up_status']='上传失败，已经超过重试次数'
+                new_value['status']=-1
+                down_db.find_one_and_update({'_id':item['_id']},{'$set':new_value})
+                break
+            elif 'file exists' in msg:
+                new_value['up_status']='远程文件已存在'
+                new_value['status']=-1
+                down_db.find_one_and_update({'_id':item['_id']},{'$set':new_value})
+                break
+            elif 'create upload session fail' in msg:
+                new_value['up_status']='创建实例失败！'
+                new_value['status']=-1
+                down_db.find_one_and_update({'_id':item['_id']},{'$set':new_value})
+                break
+            else:
+                new_value['up_status']='上传成功！'
+                new_value['status']=0
+                down_db.find_one_and_update({'_id':item['_id']},{'$set':new_value})
+                os.remove(localpath)
+                break
+            down_db.find_one_and_update({'_id':item['_id']},{'$set':new_value})
+        except Exception as e:
+            print(e)
+            break
+
+
+def get_tasks(status):
+    tasks=down_db.find({'status':status})
+    result=[]
+    for t in tasks:
+        info={}
+        info['gid']=t['gid']
+        info['idx']=t['idx']
+        info['name']=t['name']
+        info['downloadUrl']=t['downloadUrl']
+        info['size']=t['size']
+        info['down_status']=t['down_status']
+        info['up_status']=t['up_status']
+        info['selectable']=t['selectable']
+        info['selected']=t['selected']
+        info['status']=t['status']
+        result.append(info)
+    return result
+
+def Aria2Method(action,**kwargs):
+    p,status=get_aria2()
+    if not status:
+        return {'status':False,'msg':p}
+    if action in ['pause','unpause']:
+        for gid in kwargs['gids']:
+            gid,idx=gid.split('#')
+            p.forcePause(gid)
+    elif action in ['pauseAll','unpauseAll']:
+        eval('p.{}()'.format(action))
+    elif action in ['remove']:
+        for gid in kwargs['gids']:
+            gid,idx=gid.split('#')
+            p.forceRemove(gid)
+    elif action in ['removeAll']:
+        for gid in kwargs['gids']:
+            p.forceRemove(gid)
+    elif action=='restart':
+        for gid in kwargs['gids']:
+            p.unpause(gid)
+    elif action=='selected':
+        retdata={}
+        selected_dict={}
+        status_dict={}
+        #选择下载的gid&idx放进字典
+        for gid in kwargs['gids']:
+            gid,idx=gid.split('#')
+            idx=int(idx)
+            # p.pause(gid)
+            r=json.loads(p.tellStatus(gid))[0]['result']['status']
+            status_dict[gid]=r
+            if r=='active':
+                p.forcePause(gid)
+            selected_dict.setdefault(gid,[]).append(idx+1)
+        #之前本就选择下载的gid&idx放进字典
+        for gid in selected_dict.keys():
+            tasks=down_db.find({'gid':gid,'selected':'true'})
+            for t in tasks:
+                selected_dict[gid].append(t['idx']+1)
+        #重新处理可下载文件
+        result=[]
+        for gid,idxs in selected_dict.items():
+            idxs=[str(i) for i in idxs]
+            info={'gid':gid}
+            option={"select-file":','.join(idxs)}
+            r=p.changeOption(gid,option)
+            if status_dict[gid]=='active':
+                p.unpause(gid)
+            res=json.loads(r)[0]['result']
+            info['msg']=res
+            result.append(info)
+            for idx in idxs:
+                new_value={'selected':'true','down_status':'选择下载','status':1}
+                down_db.find_one_and_update({'gid':gid,'idx':int(idx)-1},{'$set':new_value})
+        retdata['result']=result
+        return retdata
+    elif action=='unselected':
+        retdata={}
+        selected_dict={}
+        status_dict={}
+        #先创建围表
+        for gid in kwargs['gids']:
+            gid,idx=gid.split('#')
+            nums=down_db.find({'gid':gid}).count()
+            if nums<=1:
+                result=[{'gid':gid,'msg':'当前任务只有一个文件，无法选择'}]
+                retdata['result']=result
+                return retdata
+            idx=int(idx)
+            # p.pause(gid)
+            r=json.loads(p.tellStatus(gid))[0]['result']['status']
+            status_dict[gid]=r
+            if r=='active':
+                p.forcePause(gid)
+            new_value={'selected':'false','down_status':'选择不下载','status':2}
+            down_db.find_one_and_update({'gid':gid,'idx':idx},{'$set':new_value})
+            selected_dict.setdefault(gid,[])
+        #之前本就选择下载的gid&idx放进字典
+        for gid in selected_dict.keys():
+            tasks=down_db.find({'gid':gid,'selected':'true'})
+            for t in tasks:
+                selected_dict[gid].append(int(t['idx']+1))
+        #选择不下载的gid&idx从字典移除
+        for gid in kwargs['gids']:
+            gid,idx=gid.split('#')
+            idx=int(idx)
+            # selected_dict[gid].pop(selected_dict[gid].index(idx+1))
+        #重新处理可下载文件
+        result=[]
+        for gid,idxs in selected_dict.items():
+            idxs=[str(i) for i in idxs]
+            info={'gid':gid}
+            option={"select-file":','.join(idxs)}
+            r=p.changeOption(gid,option)
+            if status_dict[gid]=='active':
+                p.unpause(gid)
+            res=json.loads(r)[0]['result']
+            info['msg']=res
+            result.append(info)
+        retdata['result']=result
+        return retdata
+
+
+
+
+def DBMethod(action,**kwargs):
+    retdata={}
+    if action in ['pause','unpause','pauseAll','unpauseAll']:
+        result=[]
+        for gid in kwargs['gids']:
+            gid,idx=gid.split('#')
+            info={'gid':gid,'idx':int(idx)}
+            task=down_db.find_one({'gid':gid,'idx':int(idx)})
+            if task['down_status']=='100.0%':
+                info['msg']='文件下载完成！无法更改上传状态'
+            elif task['down_status']=='下载出错':
+                info['msg']='失败任务只能重启'
+            else:
+                new_value={}
+                if action in ['pauseAll','pause']:
+                    new_value['down_status']='暂停下载'
+                else:
+                    new_value['down_status']='开始下载'
+                down_db.update_many({'gid':gid},{'$set':new_value})
+                info['msg']='更改状态成功'
+            result.append(info)
+    elif action in ['remove']:
+        result=[]
+        for gid in kwargs['gids']:
+            gid,idx=gid.split('#')
+            info={'gid':gid,'idx':int(idx)}
+            task=down_db.find_one({'gid':gid,'idx':int(idx)})
+            if task['down_status']=='100.0%' and 'partition upload success' in task['up_status']:
+                info['msg']='正在上传的任务，无法更改状态'
+            else:
+                down_db.remove(info)
+                info['msg']='删除任务成功'
+            try:
+                os.remove(task['localpath'])
+            except:
+                print('未能成功删除本地文件')
+                info['msg']='删除任务成功。但是未能成功删除本地文件'
+            result.append(info)
+    elif action in ['removeAll']:
+        result=[]
+        for gid in kwargs['gids']:
+            info={'gid':gid}
+            task=down_db.find_one({'gid':gid})
+            if task['down_status']=='100.0%' and 'partition upload success' in task['up_status']:
+                info['msg']='正在上传的任务，无法更改状态'
+            else:
+                down_db.delete_many(info)
+                info['msg']='删除任务成功'
+            try:
+                os.delete_many(task['localpath'])
+            except:
+                print('未能成功删除本地文件')
+                info['msg']='删除任务成功。但是未能成功删除本地文件'
+            result.append(info)
+    elif action=='restart':
+        result=[]
+        for gid in kwargs['gids']:
+            info={'gid':gid}
+            new_value={'status':1}
+            down_db.update_many({'gid':gid},{'$set':new_value})
+            info['msg']='更改状态成功'
+            it=down_db.find_one({'gid':gid})
+            user=it['user']
+            remote_dir=it['remote_dir']
+            cmd=u'python {} download_and_upload "{}" "{}" {} {}'.format(os.path.join(config_dir,'function.py'),1,remote_dir,user,gid)
+            print cmd
+            subprocess.Popen(cmd,shell=True)
+            result.append(info)
+    elif action in ['unselected','selected']:
+        return None
+    retdata['result']=result
+    return retdata
+
 
 
 if __name__=='__main__':

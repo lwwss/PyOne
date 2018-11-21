@@ -1,7 +1,9 @@
-
 #-*- coding=utf-8 -*-
+import eventlet
+eventlet.monkey_patch()
 from flask import Flask,render_template,redirect,abort,make_response,jsonify,request,url_for,Response
 from flask_sqlalchemy import Pagination
+from werkzeug.contrib.fixers import ProxyFix
 import json
 from collections import OrderedDict
 import subprocess
@@ -17,9 +19,7 @@ from shelljob import proc
 import time
 import os
 import sys
-import eventlet
 
-eventlet.monkey_patch()
 
 reload(sys)
 sys.setdefaultencoding("utf-8")
@@ -27,6 +27,7 @@ sys.setdefaultencoding("utf-8")
 
 #######flask
 app=Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app)
 app.secret_key=os.path.join(config_dir,'PyOne'+password)
 cache = Cache(app, config={'CACHE_TYPE': 'redis'})
 limiter = Limiter(
@@ -135,7 +136,7 @@ def _getdownloadurl(id,user):
     app_url=GetAppUrl()
     token=GetToken(user=user)
     filename=GetName(id)
-    ext=filename.split('.')[-1]
+    ext=filename.split('.')[-1].lower()
     if ext in ['webm','avi','mpg', 'mpeg', 'rm', 'rmvb', 'mov', 'wmv', 'mkv', 'asf']:
         downloadUrl=_thunbnail(id,user)
         downloadUrl=downloadUrl.replace('thumbnail','videomanifest')+'&part=index&format=dash&useScf=True&pretranscode=0&transcodeahead=0'
@@ -209,7 +210,7 @@ def GetHead(path):
 
 
 def CanEdit(filename):
-    ext=filename.split('.')[-1]
+    ext=filename.split('.')[-1].lower()
     if ext in ["html","htm","php","css","go","java","js","json","txt","sh","md",".password"]:
         return True
     else:
@@ -342,10 +343,11 @@ def has_verify(path):
 
 
 def path_list(path):
-    if path.split(':')=='':
+    path=urllib.unquote(path)
+    if path.split(':',1)=='':
         plist=[path+'/']
     else:
-        user,n_path=path.split(':')
+        user,n_path=path.split(':',1)
         if n_path.startswith('/'):
             n_path=n_path[1:]
         if n_path.endswith('/'):
@@ -353,8 +355,6 @@ def path_list(path):
         plist=n_path.split('/')
         plist=['{}:/{}'.format(user,plist[0])]+plist[1:]
     return plist
-
-
 
 def get_od_user():
     config_path=os.path.join(config_dir,'config.py')
@@ -410,10 +410,16 @@ def before_request():
     # print '{}:{}:{}'.format(request.endpoint,ip,ua)
     referrer=request.referrer if request.referrer is not None else 'no-referrer'
 
+@app.errorhandler(500)
+def page_not_found(e):
+    # note that we set the 500 status explicitly
+    return render_template('500.html',cur_user=''), 500
+
 @app.route('/<path:path>',methods=['POST','GET'])
 @app.route('/',methods=['POST','GET'])
 @limiter.limit("200/minute;50/second")
 def index(path='A:/'):
+    path=urllib.unquote(path)
     if path=='favicon.ico':
         return redirect('https://onedrive.live.com/favicon.ico')
     if items.count()==0:
@@ -422,6 +428,10 @@ def index(path='A:/'):
         else:
             #subprocess.Popen('python {} UpdateFile'.format(os.path.join(config_dir,'function.py')),shell=True)
             return make_response('<h1>正在更新数据！如果您是网站管理员，请在后台运行命令：python function.py UpdateFile</h1>')
+    try:
+        path.split(':')
+    except:
+        path='A:/'+path
     #参数
     user,n_path=path.split(':')
     if n_path=='':
@@ -494,28 +504,33 @@ def show(fileid,user):
     ext=name.split('.')[-1].lower()
     path=GetPath(fileid)
     if request.method=='POST':
-        url=request.url.replace(':80','').replace(':443','')
+        url=request.url.replace(':80','').replace(':443','').encode('utf-8')
+        inner_url='/'.join(url.split('/')[:3])+'/'+urllib.quote('/'.join(url.split('/')[3:]))
         if ext in ['csv','doc','docx','odp','ods','odt','pot','potm','potx','pps','ppsx','ppsxm','ppt','pptm','pptx','rtf','xls','xlsx']:
             downloadUrl=GetDownloadUrl(fileid,user)
             url = 'https://view.officeapps.live.com/op/view.aspx?src='+urllib.quote(downloadUrl)
             return redirect(url)
         elif ext in ['bmp','jpg','jpeg','png','gif']:
-            return render_template('show/image.html',url=url,path=path,cur_user=user)
+            return render_template('show/image.html',url=url,inner_url=inner_url,path=path,cur_user=user)
         elif ext in ['mp4','webm']:
-            return render_template('show/video.html',url=url,path=path,cur_user=user)
+            return render_template('show/video.html',url=url,inner_url=inner_url,path=path,cur_user=user)
         elif ext in ['mp4','webm','avi','mpg', 'mpeg', 'rm', 'rmvb', 'mov', 'wmv', 'mkv', 'asf']:
-            return render_template('show/video2.html',url=url,path=path,cur_user=user)
+            return render_template('show/video2.html',url=url,inner_url=inner_url,path=path,cur_user=user)
         elif ext in ['avi','mpg', 'mpeg', 'rm', 'rmvb', 'mov', 'wmv', 'mkv', 'asf']:
-            return render_template('show/video2.html',url=url,path=path,cur_user=user)
+            return render_template('show/video2.html',url=url,inner_url=inner_url,path=path,cur_user=user)
         elif ext in ['ogg','mp3','wav']:
-            return render_template('show/audio.html',url=url,path=path,cur_user=user)
+            return render_template('show/audio.html',url=url,inner_url=inner_url,path=path,cur_user=user)
         elif CodeType(ext) is not None:
             content=_remote_content(fileid,user)
-            return render_template('show/code.html',content=content,url=url,language=CodeType(ext),path=path,cur_user=user)
+            return render_template('show/code.html',content=content,url=url,inner_url=inner_url,language=CodeType(ext),path=path,cur_user=user)
+        elif name=='.password':
+            return abort(404)
         else:
             downloadUrl=GetDownloadUrl(fileid,user)
             return redirect(downloadUrl)
     else:
+        if name=='.password':
+            return abort(404)
         if 'no-referrer' in allow_site:
             downloadUrl=GetDownloadUrl(fileid,user)
             resp=redirect(downloadUrl)
@@ -546,17 +561,22 @@ app.register_blueprint(admin_blueprint)
 app.jinja_env.globals['FetchData']=FetchData
 app.jinja_env.globals['path_list']=path_list
 app.jinja_env.globals['CanEdit']=CanEdit
+app.jinja_env.globals['quote']=urllib.quote
 app.jinja_env.globals['len']=len
 app.jinja_env.globals['enumerate']=enumerate
 app.jinja_env.globals['os']=os
 app.jinja_env.globals['re']=re
 app.jinja_env.globals['file_ico']=file_ico
 app.jinja_env.globals['title']=title
-app.jinja_env.globals['tj_code']=tj_code if tj_code is not None else ''
+app.jinja_env.globals['tj_cod   e']=tj_code if tj_code is not None else ''
 app.jinja_env.globals['get_od_user']=get_od_user
 app.jinja_env.globals['allow_site']=','.join(allow_site)
 # app.jinja_env.globals['share_path']=od_users.get('A').get('share_path')
 app.jinja_env.globals['downloadUrl_timeout']=downloadUrl_timeout
+app.jinja_env.globals['ARIA2_HOST']=ARIA2_HOST
+app.jinja_env.globals['ARIA2_PORT']=ARIA2_PORT
+app.jinja_env.globals['ARIA2_SECRET']=ARIA2_SECRET
+app.jinja_env.globals['ARIA2_SCHEME']=ARIA2_SCHEME
 ################################################################################
 #####################################启动#######################################
 ################################################################################
