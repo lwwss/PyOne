@@ -199,13 +199,16 @@ def edit():
                 rd.delete('{}:content'.format(fileid))
                 file=items.find_one({'id':fileid})
                 name=file['name']
-                path=file['path'].replace('/'+name,'').replace(name,'')
-                if path=='':
-                    path='/'
-                if not path.startswith('/'):
-                    path='/'+path
-                path='{}:{}'.format(user,path)
+                path=file['path'].replace(name,'',1)
+                if len(path.split('/'))>2 and path.split('/')[-1]=='':
+                    path=path[:-1]
+                # if path=='':
+                #     path='/'
+                # if not path.startswith('/'):
+                #     path='/'+path
+                # path='{}:{}'.format(user,path)
                 key='has_item$#$#$#$#{}$#$#$#$#{}'.format(path,name)
+                print('edit key:{}'.format(key))
                 rd.delete(key)
             else:
                 info['status']=0
@@ -310,7 +313,12 @@ def setFile(filename=None):
         filename=request.form.get('filename')
         if not n_path.startswith('/'):
             n_path='/'+n_path
-        remote_file=os.path.join(n_path,filename)
+        share_path=od_users.get(user).get('share_path')
+        if share_path!='/':
+            remote_file=os.path.join(os.path.join(share_path,n_path[1:]),filename)
+        else:
+            remote_file=os.path.join(n_path,filename)
+        print(u'remote path:{}'.format(remote_file))
         content=request.form.get('content').encode('utf-8')
         info={}
         token=GetToken(user=user)
@@ -325,6 +333,7 @@ def setFile(filename=None):
                 info['status']=0
                 info['msg']='添加成功'
                 key='has_item$#$#$#$#{}$#$#$#$#{}'.format(path,filename)
+                print('set key:{}'.format(key))
                 rd.delete(key)
             else:
                 info['status']=0
@@ -358,15 +367,11 @@ def delete():
         print 'delete {}'.format(id)
         file=items.find_one({'id':id})
         name=file['name']
-        # path=file['path'].replace('/'+name,'').replace(name,'')
-        if file['parent']=='':
-            path='/'
-        else:
-            path=items.find_one({'id':file['parent']})['path']
-        if not path.startswith('/'):
-            path='/'+path
-        path='{}:{}'.format(user,path)
+        path=file['path'].replace(name,'')
+        if len(path.split('/'))>2 and path.split('/')[-1]=='':
+            path=path[:-1]
         key='has_item$#$#$#$#{}$#$#$#$#{}'.format(path,name)
+        print('delete key:{}'.format(key))
         rd.delete(key)
         kc='{}:content'.format(id)
         rd.delete(kc)
@@ -403,6 +408,22 @@ def MoveFileToNewFolder():
             new_folder_path=new_folder_path[1:]
     result=MoveFile(fileid,new_folder_path,user)
     return jsonify({'result':result})
+
+@admin.route('/rename',methods=['POST'])
+def Rename():
+    fileid=request.form.get('fileid')
+    user=request.form.get('user')
+    new_name=request.form.get('new_name')
+    if new_name=='' or new_name is None:
+        return jsonify({'result':result})
+    else:
+        if new_name.startswith('/'):
+            new_name=new_name[1:]
+        if new_name.endswith('/'):
+            new_name=new_name[:-1]
+    result=ReName(fileid,new_name,user)
+    return jsonify({'result':result})
+
 
 ######离线下载---调用aria2
 @admin.route('/off_download',methods=['POST','GET'])

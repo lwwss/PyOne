@@ -117,6 +117,9 @@ a:hover {
                     <button class="mdui-btn mdui-btn-icon" onclick="delProduct('{{data['id']}}')">
                         <i class="mdui-icon material-icons">&#xe872;</i>
                     </button>
+                    <button class="mdui-btn mdui-btn-icon" onclick="Rename('{{data['id']}}')" mdui-tooltip="{{'{'}}content: '重命名'{{'}'}}">
+                        <i class="mdui-icon material-icons">&#xe8e1;</i>
+                    </button>
                 </td>
             </tr>
             {%else%}
@@ -139,6 +142,9 @@ a:hover {
                     <button class="mdui-btn mdui-btn-icon" onclick="moveProduct('{{data['id']}}')" mdui-tooltip="{{'{'}}content: '移动文件'{{'}'}}">
                         <i class="mdui-icon material-icons">&#xe14e;</i>
                     </button>
+                    <button class="mdui-btn mdui-btn-icon" onclick="Rename('{{data['id']}}')" mdui-tooltip="{{'{'}}content: '重命名'{{'}'}}">
+                        <i class="mdui-icon material-icons">&#xe8e1;</i>
+                    </button>
                     {%if CanEdit(data['name'])%}
                     <button class="mdui-btn mdui-btn-icon" onclick="editFile('{{data['id']}}')" mdui-tooltip="{{'{'}}content: '编辑文件'{{'}'}}">
                         <i class="mdui-icon material-icons">&#xe3c9;</i>
@@ -158,10 +164,14 @@ a:hover {
 $$(function() {
     $$('.file a').each(function() {
         $$(this).on('click', function() {
-            var form = $$('<form target=_blank method=post></form>').attr('action', $$(this).attr('href')).get(0);
-            $$(document.body).append(form);
-            form.submit();
-            $$(form).remove();
+            layer.open({
+              type: 2,
+              title: 'PyOne播放窗口',
+              shadeClose: true,
+              shade: 0.8,
+              area: ['100%', '100%'],
+              content: $$(this).attr('href')+"?action=share" //iframe的url
+            });
             return false;
         });
     });
@@ -296,6 +306,40 @@ function moveProduct(fileid){
                     }
                     else{
                         alert('移动失败');
+                    }
+                    window.location.reload();
+                },
+                complete: function(xhr) {
+                    $('#layui-layer-shade1').remove();
+                }
+            });
+    });
+}
+
+function Rename(fileid){
+    layer.prompt({
+        formType: 0,
+        title: '请输入新文件名（记得带后缀）',
+    },
+    function(value, index, elem) {
+        layer.close(index);
+        $.ajax({
+                type: "POST",
+                url: "{{url_for('admin.Rename')}}",
+                data: { fileid: fileid,new_name:value,user:"{{cur_user}}" },
+                async: false,//使用同步的方式,true为异步方式
+                dataType: "json",
+                beforeSend: function(xhr) {
+                    var index2 = layer.load(2, {
+                        shade: [0.1, '#fff'] //0.1透明度的白色背景
+                    });
+                },
+                success: function(data) {
+                    if(data.result){
+                        alert('重命名成功');
+                    }
+                    else{
+                        alert('重命名失败');
                     }
                     window.location.reload();
                 },
